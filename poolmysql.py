@@ -2,16 +2,20 @@
 #-*- coding:utf-8 -*-
 
 
-from datetime import datetime, timedelta
-from contextlib import contextmanager
-
 import MySQLdb
-
+from datetime import datetime, timedelta
+from contextlib import contextmanager, closing
 from base.smartpool import Connection
 
 
 
 query_logger = None
+
+__all__ = [
+    "transaction",
+    "lock_str",
+    "MySQLdbConnection",
+]
 
 
 #################
@@ -112,12 +116,12 @@ def lock_str(conn, s, timeout=0):
     locked = False
 
     try:
-        locked = (conn.select("SELECT GET_LOCK(%s, %s) AS success",
-                (s, timeout), dict_cursor=True)[0]["success"] == 1)
+        locked = conn.lock(s, timeout)
         yield locked
+
     finally:
         if locked:
-            conn.select("SELECT RELEASE_LOCK(%s)", s)
+            conn.release(s)
 
 
 ###########################################
@@ -129,18 +133,26 @@ class MySQLdbConnection(Connection):
 
         # private
         self._conn = None
-        self._cursor = None
+        self._locks = []
         self._in_trans = False
         self._last_active_time = None
 
-    def __deepcopy__(self):
+    def __deepcopy__(self, memo):
         return self
+
+    @property
+    def in_trans(self):
+        return self._in_trans
+
+    @property
+    def has_lock(self):
+        return len(self._locks) > 0
 
     ################ pool interface #################
 
     @property
     def reusable(self):
-        return not self._in_trans
+        return not (self.in_trans or self.has_lock)
 
     @property
     def idle(self):
@@ -178,77 +190,93 @@ class MySQLdbConnection(Connection):
             self._conn.close()
         finally:
             self._conn = None
-            self._cursor = None
 
     def make_reusable(self):
-        self.rollback(force=True)
+        if self.in_trans:
+            self.rollback()
 
-    ################################################
+        if self.has_lock:
+            for key in self._locks:
+                self.release(key)
+
+
+    ############## base dbop #############
 
     @ready
     @active_time
     def select(self, sql, params=None, dict_cursor=False):
         qlog(self, "execute: %s - %s" % (sql, repr(params)))
 
+        cursor = None
         if dict_cursor:
-            self._cursor = self._conn.cursor(MySQLdb.cursors.DictCursor)
+            cursor = self._conn.cursor(MySQLdb.cursors.DictCursor)
         else:
-            self._cursor = self._conn.cursor()
+            cursor = self._conn.cursor()
 
-        if params is None:
-            self._cursor.execute(sql)
-        else:
-            self._cursor.execute(sql, params)
+        with closing(cursor) as cur:
+            if params is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql, params)
 
-        return self._cursor.fetchall()
+            return cur.fetchall()
 
     @ready
     @active_time
     def insert(self, sql, params=None):
         qlog(self, "execute: %s - %s" % (sql, repr(params)))
 
-        self._cursor = self._conn.cursor()
-        if params is None:
-            self._cursor.execute(sql)
-        else:
-            self._cursor.execute(sql, params)
+        cursor = self._conn.cursor()
+        with closing(cursor) as cur:
+            if params is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql, params)
 
-        return self._cursor.lastrowid
+            return cur.lastrowid
 
     @ready
     @active_time
     def execute(self, sql, params=None):
         qlog(self, "execute: %s - %s" % (sql, repr(params)))
 
-        self._cursor = self._conn.cursor()
-        if params is None:
-            return self._cursor.execute(sql)
-        else:
-            return self._cursor.execute(sql, params)
+        cursor = self._conn.cursor()
+        with closing(cursor) as cur:
+            if params is None:
+                return cur.execute(sql)
+            else:
+                return cur.execute(sql, params)
 
-    @ready
-    @active_time
+
+    ############### unreusable #############
+
     def begin(self):
         if self._in_trans:
-            raise Exception("duplicate trans")
+            raise Exception("nested trans is not allowed")
 
         self.execute("begin")
         self._in_trans = True
 
-    @ready
-    @active_time
-    def rollback(self, force=False):
-        if not force and not self._in_trans:
-            raise Exception("rollback outside trans")
-
+    def rollback(self):
         self.execute("rollback")
         self._in_trans = False
 
-    @ready
-    @active_time
     def commit(self):
-        if not self._in_trans:
-            raise Exception("commit outside trans")
-
         self.execute("commit")
         self._in_trans = False
+
+    def lock(self, key, timeout=0):
+        locked = self.select("SELECT GET_LOCK(%s, %s)", (key, timeout))[0][0] == 1
+
+        if locked:
+            self._locks.append(key)
+
+        return locked
+
+    def release(self, key):
+        released = self.select("SELECT RELEASE_LOCK(%s)", key)[0][0] == 1
+
+        if released and key in self._locks:
+            self._locks.remove(key)
+
+        return released

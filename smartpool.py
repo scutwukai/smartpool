@@ -2,6 +2,7 @@
 #-*- coding:utf-8 -*-
 
 
+import weakref
 import threading
 from functools import wraps
 
@@ -18,9 +19,14 @@ except ImportError:
         from _thread import get_ident
 
 
-
-
 ######## global vars ########
+
+
+__all__ = [
+    "getconn",
+    "init_pool",
+    "ConnectionProxy",
+]
 
 
 lock = threading.Lock()
@@ -112,8 +118,11 @@ class Connection(object):
         self._db_config = db_config
 
     def __del__(self):
-        """make sure close connection finally"""
-        safe_call(self.close)
+        """last chance for close"""
+        try:
+            self.close()
+        except:
+            pass
 
     @property
     def reusable(self):
@@ -148,28 +157,6 @@ class Connection(object):
         pass
 
 
-class ConnectionManager(object):
-    def __init__(self, pool, conn):
-        self._pool = pool
-        self._conn = conn
-
-    def __dead__(self):
-        if self._pool is None or self._conn is None:
-            return
-
-        try:
-            self._pool.setback(self._conn)
-        finally:
-            self._pool = None
-            self._conn = None
-
-    def __del__(self):
-        self.__dead__()
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-
 class ConnectionPool(object):
     def __init__(self, db_config, conn_cls, minnum, maxnum=None, maxidle=60, clean_interval=100):
         self._db_config = db_config
@@ -178,48 +165,55 @@ class ConnectionPool(object):
         self._max = minnum if maxnum is None else maxnum
         self._maxidle = maxidle
         self._clean_interval = clean_interval
+
         self._pool = []
-        self._deflict = 0
-        self._clean_count = 0
-
-    def _pop_pool(self):
-        return self._pool.pop(0)
-
-    def _enter_pool(self, conn):
-        for i in xrange(0, len(self._pool)):
-            item = self._pool[i]
-            if item.idle > conn.idle:
-                self._pool.insert(i, conn)
-                return
-
-        self._pool.append(conn)
+        self._clean_counter = 0
 
     @property
-    def deep(self):
+    def busy_array(self):
+        return sorted(self._pool, key=(lambda v: v.idle))
+
+    @property
+    def idle_array(self):
+        return sorted(self._pool, key=(lambda v: v.idle), reverse=True)
+
+    @property
+    def total(self):
         return len(self._pool)
 
     @property
-    def big(self):
-        return len(self._pool) + self._deflict
+    def idle(self):
+        counter = 0
+        for conn in self._pool:
+            if weakref.getweakrefcount(conn) < 1:
+                counter += 1
+        return counter
+
+    @property
+    def used(self):
+        return self.deep - self.idle
+
 
     def _clean(self):
-        if self.big <= self._min:
-            plog("clean: pool not big [%d / %d]" % (self.big, self._min))
+        self._clean_counter = 0
+
+        if self.total <= self._min:
+            plog("clean: pool is not big enough [idle/total/min: %d/%d/%d]" % (self.idle, self.total, self._min))
             return
 
-        if self.deep < 1:
-            plog("clean: no idle conn found [deep: %d, big: %d]" % (self.deep, self.big))
+        if self.idle < 1:
+            plog("clean: no idle conn found [idle/total/min: %d/%d/%d]" % (self.idle, self.total, self._min))
             return
 
-        total, found = (self.big - self._min), []
-        for conn in self._pool:
+        total, found = (self.total - self._min), []
+        for conn in self.idle_array:
             if conn.idle > self._maxidle:
                 found.append(conn)
                 if len(found) >= total:
                     break
 
         if len(found) < 1:
-            plog("clean: no idle conn found [deep: %d, big: %d]" % (self.deep, self.big))
+            plog("clean: no idle conn found [idle/total/min: %d/%d/%d]" % (self.idle, self.total, self._min))
             return
 
         # be sure to remove from pool first
@@ -229,54 +223,46 @@ class ConnectionPool(object):
         # do close
         for conn in found:
             safe_call(conn.close)
-        plog("clean: %d conns closed [deep: %d, big: %d]" % (len(found), self.deep, self.big))
+
+        plog("clean: %d conns closed [idle/total/min: %d/%d/%d]" % (len(found), self.idle, self.total, self._min))
+
 
     @getlock
     def get(self):
-        if self.deep > 0:
-            self._deflict += 1
-            conn = self._pop_pool()
+        # clean if need
+        if self._clean_counter >= self._clean_interval:
+           self._clean()
 
-            if not conn.ping():
-                conn.connect()
+        self._clean_counter += 1
 
-            plog("get: pop conn(%d) [deep: %d, big: %d]" % (id(conn), self.deep, self.big))
-            return ConnectionManager(self, conn)
+        # do grant
+        if self.idle > 0:
+            for conn in self.busy_array:
+                if weakref.getweakrefcount(conn) > 0:
+                    continue
 
-        if self.big < self._max:
-            self._deflict += 1
+                conn = weakref.proxy(conn)
+                if not conn.ping():
+                    conn.connect()
+                elif not conn.reusable:
+                    conn.make_reusable()
 
+                plog("get: conn(%d) [idle/total/max: %d/%d/%d]" % (id(conn), self.idle, self.total, self._max))
+                return conn
+
+        elif self.total < self._max:
             conn = self._conn_cls(**self._db_config)
+            self._pool.append(conn)
+
+            conn = weakref.proxy(conn)
             conn.connect()
 
-            plog("get: new conn(%d) [deep: %d, big: %d]" % (id(conn), self.deep, self.big))
-            return ConnectionManager(self, conn)
+            # dig the pool
+
+            plog("new: conn(%d) [idle/total/max: %d/%d/%d]" % (id(conn), self.idle, self.total, self._max))
+            return conn
 
         return None
-
-    @getlock
-    def setback(self, conn):
-        if conn is None:
-            self._deflict -= 1
-            plog("setback: conn(%d) drop because it's broken [deep: %d, big: %d]" % (id(conn), self.deep, self.big))
-            return
-
-        try:
-            conn.make_reusable()
-        except:
-            self._deflict -= 1
-            plog("setback: conn(%d) drop because it can't reuse [deep: %d, big: %d]" % (id(conn), self.deep, self.big))
-            return
-
-        self._deflict -= 1
-        self._enter_pool(conn)
-        plog("setback: conn(%d) return [deep: %d, big: %d]" % (id(conn), self.deep, self.big))
-
-        # clean if need
-        self._clean_count += 1
-        if self._clean_count >= self._clean_interval:
-            self._clean_count = 0
-            self._clean()
 
 
 ############ lazy proxy  #############
@@ -295,9 +281,10 @@ def lazy(db_name, local, name):
         finally:
             if conn.reusable:
                 safe_call(local.pop, "conn")
-                conn.__dead__()
+                del conn
             else:
                 local["conn"] = conn
+
     return wrap_func
 
 
