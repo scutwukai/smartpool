@@ -274,7 +274,7 @@ class MySQLdbConnection(Connection):
         return locked
 
     def release(self, key):
-        released = self.select("SELECT RELEASE_LOCK(%s)", key)[0][0] == 1
+        released = self.select("SELECT RELEASE_LOCK(%s)", (key, ))[0][0] == 1
 
         if released and key in self._locks:
             self._locks.remove(key)
