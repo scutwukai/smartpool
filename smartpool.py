@@ -2,6 +2,7 @@
 #-*- coding:utf-8 -*-
 
 
+import os
 import weakref
 import threading
 from functools import wraps
@@ -29,32 +30,45 @@ __all__ = [
 ]
 
 
-lock = threading.Lock()
+lock = threading.RLock()
 pools = {}
 
 
 ######## setting ########
 
-
+# depreciated, will remove soon
 coroutine_mode = False
+
+# the logger for logging, set outside
 pool_logger = None
 
 
 ########### utils ############
 
-
 class EmptyPoolError(Exception):
     pass
 
+def hex_ident():
+    ident = get_ident()
+    if not isinstance(ident, int):
+        ident = id(ident)
 
-def log(ident, msg, logger):
-    if logger is None:
+    return "%x" % ident
+
+def log(msg):
+    if pool_logger is None:
         return
-    logger("%d - %s" % (ident, msg))
 
-def plog(msg):
-    tid = threading.current_thread().ident
-    log(tid, msg, pool_logger)
+    pid = os.getpid()
+    ident = hex_ident()
+
+    pool_logger("[%d][%s]%s" % (pid, ident, msg))
+
+def plog(pool, msg):
+    full_msg = "[%s][idle/total/min: %d/%d/%d] - %s" % \
+        (pool.name, pool.idle, pool.total, pool.min, msg)
+
+    log(full_msg)
 
 def safe_call(func, *args, **kwargs):
     try:
@@ -99,15 +113,16 @@ class Local(object):
 
 def getlock(old_handler):
     @wraps(old_handler)
-    def new_handler(*args, **kwargs):
+    def new_handler(self, *args, **kwargs):
         if coroutine_mode:
-            return old_handler(*args, **kwargs)
-        else:
-            lock.acquire(True)
-            try:
-                return old_handler(*args, **kwargs)
-            finally:
-                lock.release()
+            return old_handler(self, *args, **kwargs)
+
+        lock.acquire(True)
+        try:
+            return old_handler(self, *args, **kwargs)
+        finally:
+            lock.release()
+
     return new_handler
 
 
@@ -158,7 +173,8 @@ class Connection(object):
 
 
 class ConnectionPool(object):
-    def __init__(self, db_config, conn_cls, minnum, maxnum=None, maxidle=60, clean_interval=100):
+    def __init__(self, db_name, db_config, conn_cls, minnum, maxnum=None, maxidle=60, clean_interval=100):
+        self._db_name = db_name
         self._db_config = db_config
         self._conn_cls = conn_cls
         self._min = minnum
@@ -168,6 +184,16 @@ class ConnectionPool(object):
 
         self._pool = []
         self._clean_counter = 0
+
+        plog(self, "init finished!")
+
+    @property
+    def name(self):
+        return self._db_name
+
+    @property
+    def min(self):
+        return self._min
 
     @property
     def busy_array(self):
@@ -195,14 +221,15 @@ class ConnectionPool(object):
 
 
     def _clean(self):
+        plog(self, "clean: prepare to clean!")
         self._clean_counter = 0
 
         if self.total <= self._min:
-            plog("clean: pool is not big enough [idle/total/min: %d/%d/%d]" % (self.idle, self.total, self._min))
+            plog(self, "clean: pool is tiny, do nothing!")
             return
 
         if self.idle < 1:
-            plog("clean: no idle conn found [idle/total/min: %d/%d/%d]" % (self.idle, self.total, self._min))
+            plog(self, "clean: no idle conn found, do nothing!")
             return
 
         total, found = (self.total - self._min), []
@@ -213,7 +240,7 @@ class ConnectionPool(object):
                     break
 
         if len(found) < 1:
-            plog("clean: no idle conn found [idle/total/min: %d/%d/%d]" % (self.idle, self.total, self._min))
+            plog(self, "clean: no idle conn found, do nothing!")
             return
 
         # be sure to remove from pool first
@@ -224,7 +251,7 @@ class ConnectionPool(object):
         for conn in found:
             safe_call(conn.close)
 
-        plog("clean: %d conns closed [idle/total/min: %d/%d/%d]" % (len(found), self.idle, self.total, self._min))
+        plog(self, "clean: idle conn found, %d closed!" % len(found))
 
 
     @getlock
@@ -236,10 +263,14 @@ class ConnectionPool(object):
         self._clean_counter += 1
 
         # do grant
+        plog(self, "prepare to grant conn!")
+
         if self.idle > 0:
             for conn in self.busy_array:
                 if weakref.getweakrefcount(conn) > 0:
                     continue
+
+                conn_ident = id(conn)
 
                 conn = weakref.proxy(conn)
                 if not conn.ping():
@@ -247,19 +278,21 @@ class ConnectionPool(object):
                 elif not conn.reusable:
                     conn.make_reusable()
 
-                plog("get: conn(%d) [idle/total/max: %d/%d/%d]" % (id(conn), self.idle, self.total, self._max))
+                plog(self, "idle conn(%x) was granted!" % conn_ident)
                 return conn
 
         elif self.total < self._max:
             conn = self._conn_cls(**self._db_config)
             self._pool.append(conn)
 
+            conn_ident = id(conn)
+
             conn = weakref.proxy(conn)
             conn.connect()
 
             # dig the pool
 
-            plog("new: conn(%d) [idle/total/max: %d/%d/%d]" % (id(conn), self.idle, self.total, self._max))
+            plog(self, "not idle conn found, new conn(%x) was granted!" % conn_ident)
             return conn
 
         return None
@@ -306,4 +339,4 @@ def getconn(db_name):
 
 # init before concurrence
 def init_pool(db_name, *args, **kwargs):
-    pools[db_name] = ConnectionPool(*args, **kwargs)
+    pools[db_name] = ConnectionPool(db_name, *args, **kwargs)
