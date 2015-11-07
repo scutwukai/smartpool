@@ -36,8 +36,6 @@ pools = {}
 
 ######## setting ########
 
-# depreciated, will remove soon
-coroutine_mode = False
 
 # the logger for logging, set outside
 pool_logger = None
@@ -110,20 +108,6 @@ class Local(object):
 
 ############ pool logic ###########
 
-
-def getlock(old_handler):
-    @wraps(old_handler)
-    def new_handler(self, *args, **kwargs):
-        if coroutine_mode:
-            return old_handler(self, *args, **kwargs)
-
-        lock.acquire(True)
-        try:
-            return old_handler(self, *args, **kwargs)
-        finally:
-            lock.release()
-
-    return new_handler
 
 
 class Connection(object):
@@ -221,8 +205,9 @@ class ConnectionPool(object):
 
 
     def _clean(self):
-        plog(self, "clean: prepare to clean!")
         self._clean_counter = 0
+
+        plog(self, "clean: prepare to clean!")
 
         if self.total <= self._min:
             plog(self, "clean: pool is tiny, do nothing!")
@@ -254,32 +239,39 @@ class ConnectionPool(object):
         plog(self, "clean: idle conn found, %d closed!" % len(found))
 
 
-    @getlock
+    def _pop_idle(self):
+        for conn in self.busy_array:
+            if weakref.getweakrefcount(conn) > 0:
+                continue
+
+            return id(conn), weakref.proxy(conn)
+
+        return None, None
+
+
     def get(self):
-        # clean if need
-        if self._clean_counter >= self._clean_interval:
-           self._clean()
 
-        self._clean_counter += 1
+        with lock:
+            # clean if need
+            if self._clean_counter >= self._clean_interval:
+                self._clean()
 
-        # do grant
-        plog(self, "prepare to grant conn!")
+            self._clean_counter += 1
 
-        if self.idle > 0:
-            for conn in self.busy_array:
-                if weakref.getweakrefcount(conn) > 0:
-                    continue
+            # do grant
+            plog(self, "prepare to grant conn!")
+            conn_ident, conn = self._pop_idle()
 
-                conn_ident = id(conn)
 
-                conn = weakref.proxy(conn)
-                if not conn.ping():
-                    conn.connect()
-                elif not conn.reusable:
-                    conn.make_reusable()
+        if conn is not None:
+            if not conn.ping():
+                conn.connect()
 
-                plog(self, "idle conn(%x) was granted!" % conn_ident)
-                return conn
+            elif not conn.reusable:
+                conn.make_reusable()
+
+            plog(self, "idle conn(%x) was granted!" % conn_ident)
+            return conn
 
         elif self.total < self._max:
             conn = self._conn_cls(**self._db_config)
