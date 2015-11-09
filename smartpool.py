@@ -248,8 +248,14 @@ class ConnectionPool(object):
 
         return None, None
 
+    def _new_conn(self):
+        conn = self._conn_cls(**self._db_config)
+        self._pool.append(conn)
+
+        return id(conn), weakref.proxy(conn)
 
     def get(self):
+        conn_ident, conn = None, None
 
         with lock:
             # clean if need
@@ -258,11 +264,11 @@ class ConnectionPool(object):
 
             self._clean_counter += 1
 
-            # do grant
+            # try get idle
             plog(self, "prepare to grant conn!")
             conn_ident, conn = self._pop_idle()
 
-
+        # if idle found
         if conn is not None:
             if not conn.ping():
                 conn.connect()
@@ -273,20 +279,20 @@ class ConnectionPool(object):
             plog(self, "idle conn(%x) was granted!" % conn_ident)
             return conn
 
-        elif self.total < self._max:
-            conn = self._conn_cls(**self._db_config)
-            self._pool.append(conn)
+        # if not found, try dig the pool
+        with lock:
+            conn_ident, conn = self._new_conn() if self.total < self._max else (None, None)
 
-            conn_ident = id(conn)
-
-            conn = weakref.proxy(conn)
+        # dig success, happy end
+        if conn is not None:
+            # first connect
             conn.connect()
-
-            # dig the pool
 
             plog(self, "not idle conn found, new conn(%x) was granted!" % conn_ident)
             return conn
 
+        # dig fail, bad end
+        plog(self, "grant conn failed!")
         return None
 
 
@@ -299,7 +305,7 @@ def lazy(db_name, local, name):
         if conn is None:
             conn = getconn(db_name)
             if conn is None:
-                raise EmptyPoolError()
+                raise EmptyPoolError(db_name)
 
         try:
             return getattr(conn, name)(*args, **kwargs)
